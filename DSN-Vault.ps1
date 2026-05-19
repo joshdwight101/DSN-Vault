@@ -29,6 +29,8 @@ using System.Windows.Forms;
 using System.Drawing;
 using System.Collections.Generic;
 using Microsoft.Win32;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace DSNVault
 {
@@ -68,7 +70,59 @@ namespace DSNVault
             return list;
         }
 
-        public static void CreateBackup(string customName, string targetPath, bool is64Bit, List<DsnItem> selectedDsns, Action<string> logger)
+        private static string EncryptString(string plainText, string password, out string saltStr)
+        {
+            byte[] salt = new byte[16];
+            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider()) {
+                rng.GetBytes(salt);
+            }
+            saltStr = Convert.ToBase64String(salt);
+
+            using (Rfc2898DeriveBytes keyDerivation = new Rfc2898DeriveBytes(password, salt, 10000))
+            {
+                using (Aes aes = Aes.Create())
+                {
+                    aes.Key = keyDerivation.GetBytes(32);
+                    aes.IV = keyDerivation.GetBytes(16);
+
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        using (CryptoStream cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
+                        {
+                            byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                            cs.Write(plainBytes, 0, plainBytes.Length);
+                        }
+                        return Convert.ToBase64String(ms.ToArray());
+                    }
+                }
+            }
+        }
+
+        private static string DecryptString(string cipherText, string password, string saltStr)
+        {
+            byte[] salt = Convert.FromBase64String(saltStr);
+            byte[] cipherBytes = Convert.FromBase64String(cipherText);
+
+            using (Rfc2898DeriveBytes keyDerivation = new Rfc2898DeriveBytes(password, salt, 10000))
+            {
+                using (Aes aes = Aes.Create())
+                {
+                    aes.Key = keyDerivation.GetBytes(32);
+                    aes.IV = keyDerivation.GetBytes(16);
+
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        using (CryptoStream cs = new CryptoStream(ms, aes.CreateDecryptor(), CryptoStreamMode.Write))
+                        {
+                            cs.Write(cipherBytes, 0, cipherBytes.Length);
+                        }
+                        return Encoding.UTF8.GetString(ms.ToArray());
+                    }
+                }
+            }
+        }
+
+        public static void CreateBackup(string customName, string targetPath, bool is64Bit, List<DsnItem> selectedDsns, Action<string> logger, string password)
         {
             string timeStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             
@@ -91,7 +145,8 @@ namespace DSNVault
             if (logger != null) logger(string.Format("Initializing {0} backup: {1}", arch, cleanName));
             if (logger != null) logger("Target path: " + fullPath);
 
-            using (XmlWriter writer = XmlWriter.Create(fullPath, new XmlWriterSettings { Indent = true }))
+            StringWriter sw = new StringWriter();
+            using (XmlWriter writer = XmlWriter.Create(sw, new XmlWriterSettings { Indent = true }))
             {
                 writer.WriteStartElement("ODBCBackup");
                 writer.WriteAttributeString("Timestamp", timeStamp);
@@ -148,7 +203,32 @@ namespace DSNVault
 
                 writer.WriteEndElement(); // ODBCBackup
             }
-            if (logger != null) logger("Backup complete. Payload safely serialized to XML.");
+
+            string xmlPayload = sw.ToString();
+
+            if (!string.IsNullOrEmpty(password))
+            {
+                if (logger != null) logger("Encrypting payload with AES-256...");
+                string saltStr;
+                string cipherText = EncryptString(xmlPayload, password, out saltStr);
+                
+                using (XmlWriter writer = XmlWriter.Create(fullPath, new XmlWriterSettings { Indent = true }))
+                {
+                    writer.WriteStartElement("SecureVault");
+                    writer.WriteAttributeString("Timestamp", timeStamp);
+                    writer.WriteAttributeString("Label", customName);
+                    writer.WriteAttributeString("Architecture", arch);
+                    writer.WriteElementString("Salt", saltStr);
+                    writer.WriteElementString("Ciphertext", cipherText);
+                    writer.WriteEndElement();
+                }
+            }
+            else
+            {
+                File.WriteAllText(fullPath, xmlPayload);
+            }
+
+            if (logger != null) logger("Backup complete. Payload safely serialized.");
         }
 
         private static void WriteRegValue(XmlWriter writer, RegistryKey key, string valName)
@@ -223,11 +303,31 @@ namespace DSNVault
             }
         }
 
-        public static void RestoreBackup(string filePath, Action<string> logger)
+        public static void RestoreBackup(string filePath, Action<string> logger, string password)
         {
-            if (logger != null) logger("Loading XML payload: " + Path.GetFileName(filePath));
+            if (logger != null) logger("Loading payload: " + Path.GetFileName(filePath));
             XmlDocument doc = new XmlDocument();
             doc.Load(filePath);
+
+            if (doc.DocumentElement.Name == "SecureVault")
+            {
+                if (string.IsNullOrEmpty(password)) {
+                    throw new Exception("This backup is encrypted. Please enter the password in the text box before deploying.");
+                }
+                if (logger != null) logger("Decrypting payload...");
+                string salt = doc.DocumentElement["Salt"].InnerText;
+                string cipher = doc.DocumentElement["Ciphertext"].InnerText;
+                
+                string plainXml;
+                try {
+                    plainXml = DecryptString(cipher, password, salt);
+                } catch {
+                    throw new Exception("Decryption failed. Incorrect password or corrupted payload.");
+                }
+                
+                doc = new XmlDocument();
+                doc.LoadXml(plainXml);
+            }
 
             XmlNodeList hives = doc.GetElementsByTagName("RegistryHive");
             foreach (XmlNode hive in hives)
@@ -321,7 +421,7 @@ namespace DSNVault
         private void InitializeComponent()
         {
             this.Text = "DSN-Vault // Universal ODBC Admin Tool";
-            this.Size = new Size(570, 780); // Increased height to accommodate the console
+            this.Size = new Size(570, 810);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -329,7 +429,7 @@ namespace DSNVault
 
             Label lblTitle = new Label() { Text = "ODBC Selective Deployment Vault", Font = new Font("Segoe UI", 12, FontStyle.Bold), Location = new Point(15, 15), Size = new Size(400, 25) };
             
-            tabCtrl = new TabControl() { Location = new Point(15, 50), Size = new Size(525, 510), Font = new Font("Segoe UI", 9) };
+            tabCtrl = new TabControl() { Location = new Point(15, 50), Size = new Size(525, 540), Font = new Font("Segoe UI", 9) };
             
             page64 = new TabPage("64-bit System DSNs");
             page64.BackColor = Color.White;
@@ -344,9 +444,9 @@ namespace DSNVault
             tabCtrl.TabPages.Add(page64);
             tabCtrl.TabPages.Add(page32);
 
-            Label lblConsole = new Label() { Text = "Live Status Console:", Location = new Point(15, 570), Size = new Size(200, 15), Font = new Font("Segoe UI", 9, FontStyle.Bold) };
+            Label lblConsole = new Label() { Text = "Live Status Console:", Location = new Point(15, 600), Size = new Size(200, 15), Font = new Font("Segoe UI", 9, FontStyle.Bold) };
             txtConsole = new TextBox() { 
-                Location = new Point(15, 590), 
+                Location = new Point(15, 620), 
                 Size = new Size(525, 130), 
                 Multiline = true, 
                 ReadOnly = true, 
@@ -403,11 +503,14 @@ namespace DSNVault
                 } 
             };
 
-            Button btnBackup = new Button() { Text = "Capture Backup", Location = new Point(360, 239), Size = new Size(130, 25), Font = new Font("Segoe UI", 9, FontStyle.Bold), BackColor = Color.FromArgb(0, 120, 212), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            btnBackup.Click += (s, e) => HandleBackup(is64Bit, capturedTxt, chkDsns);
+            Label lblPass = new Label() { Text = "Encryption Password (Optional):", Location = new Point(15, 270), Size = new Size(250, 20) };
+            TextBox txtPass = new TextBox() { Location = new Point(15, 290), Size = new Size(330, 23), UseSystemPasswordChar = true };
 
-            Label lblList = new Label() { Text = "Available Backups (" + backupFolder + "):", Location = new Point(15, 285), Size = new Size(500, 20) };
-            lst = new ListBox() { Location = new Point(15, 305), Size = new Size(330, 160), Font = new Font("Consolas", 9.5f) };
+            Button btnBackup = new Button() { Text = "Capture Backup", Location = new Point(360, 289), Size = new Size(130, 25), Font = new Font("Segoe UI", 9, FontStyle.Bold), BackColor = Color.FromArgb(0, 120, 212), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            btnBackup.Click += (s, e) => HandleBackup(is64Bit, capturedTxt, chkDsns, txtPass);
+
+            Label lblList = new Label() { Text = "Available Backups (" + backupFolder + "):", Location = new Point(15, 325), Size = new Size(500, 20) };
+            lst = new ListBox() { Location = new Point(15, 345), Size = new Size(330, 150), Font = new Font("Consolas", 9.5f) };
             
             ListBox capturedLst = lst;
             
@@ -429,20 +532,20 @@ namespace DSNVault
                 }
             };
 
-            mnuRestore.Click += (s, e) => HandleRestore(capturedLst);
+            mnuRestore.Click += (s, e) => HandleRestore(capturedLst, txtPass);
             mnuDelete.Click += (s, e) => HandleDelete(capturedLst);
 
-            Button btnRestore = new Button() { Text = "Deploy Selected", Location = new Point(360, 305), Size = new Size(130, 35), Font = new Font("Segoe UI", 9, FontStyle.Bold), BackColor = Color.FromArgb(16, 124, 65), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-            btnRestore.Click += (s, e) => HandleRestore(capturedLst);
+            Button btnRestore = new Button() { Text = "Deploy Selected", Location = new Point(360, 345), Size = new Size(130, 35), Font = new Font("Segoe UI", 9, FontStyle.Bold), BackColor = Color.FromArgb(16, 124, 65), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            btnRestore.Click += (s, e) => HandleRestore(capturedLst, txtPass);
 
-            Button btnRefresh = new Button() { Text = "Refresh List", Location = new Point(360, 350), Size = new Size(130, 25), FlatStyle = FlatStyle.Flat };
+            Button btnRefresh = new Button() { Text = "Refresh List", Location = new Point(360, 390), Size = new Size(130, 25), FlatStyle = FlatStyle.Flat };
             btnRefresh.Click += (s, e) => {
                 RefreshBackupList();
                 chkDsns.Items.Clear();
                 foreach(var dsn in VaultEngine.GetAvailableDSNs(is64Bit)) chkDsns.Items.Add(dsn, true);
             };
 
-            page.Controls.AddRange(new Control[] { lblSelect, chkDsns, btnToggleAll, lblInput, capturedTxt, btnBackup, lblList, capturedLst, btnRestore, btnRefresh });
+            page.Controls.AddRange(new Control[] { lblSelect, chkDsns, btnToggleAll, lblInput, capturedTxt, lblPass, txtPass, btnBackup, lblList, capturedLst, btnRestore, btnRefresh });
         }
 
         private void RefreshBackupList()
@@ -472,7 +575,7 @@ namespace DSNVault
             Log(string.Format("Refreshed inventory: {0} total backups found.", lst32.Items.Count + lst64.Items.Count));
         }
 
-        private void HandleBackup(bool is64Bit, TextBox txtName, CheckedListBox chkDsns)
+        private void HandleBackup(bool is64Bit, TextBox txtName, CheckedListBox chkDsns, TextBox txtPass)
         {
             if (chkDsns.CheckedItems.Count == 0) {
                 MessageBox.Show("Please select at least one DSN to backup.", "No DSNs Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -487,7 +590,7 @@ namespace DSNVault
             string label = string.IsNullOrWhiteSpace(txtName.Text) || txtName.Text == "e.g., Sage300_Production" ? "GenericBackup" : txtName.Text.Trim();
             try
             {
-                VaultEngine.CreateBackup(label, backupFolder, is64Bit, selectedDsns, Log);
+                VaultEngine.CreateBackup(label, backupFolder, is64Bit, selectedDsns, Log, txtPass.Text);
                 string arch = is64Bit ? "64-bit" : "32-bit";
                 Log("SUCCESS: " + arch + " ODBC configurations captured successfully.");
                 MessageBox.Show(arch + " ODBC configurations successfully backed up!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -504,7 +607,7 @@ namespace DSNVault
             }
         }
 
-        private void HandleRestore(ListBox lst)
+        private void HandleRestore(ListBox lst, TextBox txtPass)
         {
             if (lst.SelectedItem == null)
             {
@@ -520,7 +623,7 @@ namespace DSNVault
                 try
                 {
                     Log("Initiating deployment for payload: " + lst.SelectedItem.ToString());
-                    VaultEngine.RestoreBackup(selectedFile, Log);
+                    VaultEngine.RestoreBackup(selectedFile, Log, txtPass.Text);
                     Log("SUCCESS: ODBC configurations deployed cleanly.");
                     MessageBox.Show("ODBC configurations successfully written to Windows 11 Registry!", "Deployment Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
